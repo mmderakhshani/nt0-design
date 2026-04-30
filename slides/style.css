@@ -1,0 +1,214 @@
+/* Unified VLA — white template with green accents */
+
+:root {
+  --accent: #16a34a;        /* green-600 */
+  --accent-strong: #15803d; /* green-700 */
+  --accent-soft: #dcfce7;   /* green-100 */
+  --accent-line: #86efac;   /* green-300 */
+  --ink: #111827;           /* gray-900 */
+  --muted: #6b7280;         /* gray-500 */
+  --rule: #e5e7eb;          /* gray-200 */
+}
+
+/* Base — force a pure white canvas */
+.slidev-layout {
+  background: #ffffff !important;
+  color: var(--ink);
+}
+
+/* Headings use the accent green */
+.slidev-layout h1,
+.slidev-layout h2,
+.slidev-layout h3,
+.slidev-layout h4 {
+  color: var(--accent-strong);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Underline bar under h1 titles */
+.slidev-layout h1 {
+  position: relative;
+  padding-bottom: 0.25em;
+}
+.slidev-layout h1::after {
+  content: "";
+  display: block;
+  width: 2.5rem;
+  height: 3px;
+  background: var(--accent);
+  border-radius: 2px;
+  margin-top: 0.35em;
+}
+
+/* Center layouts shouldn't get a left-aligned underline */
+.slidev-layout.text-center h1::after {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Bold text, inline code, links all echo the accent */
+.slidev-layout strong {
+  color: var(--accent-strong);
+}
+.slidev-layout a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-decoration-color: var(--accent-line);
+  text-underline-offset: 2px;
+}
+.slidev-layout code:not(pre code) {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+/* Fenced code blocks: soft green border + white background */
+.slidev-layout pre,
+.slidev-layout .slidev-code-wrapper,
+.slidev-layout div[class*="language-"] pre {
+  background: #f9fafb !important;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+}
+
+/* Tables — clean, with green header row */
+.slidev-layout table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9em;
+}
+.slidev-layout table th {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  border-bottom: 2px solid var(--accent);
+  padding: 0.4em 0.7em;
+  text-align: left;
+}
+.slidev-layout table td {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.35em 0.7em;
+  color: var(--ink);
+}
+
+/* Blockquote / divider accents */
+.slidev-layout blockquote {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 0.5em 0.8em;
+  color: var(--ink);
+  border-radius: 0 6px 6px 0;
+}
+.slidev-layout hr {
+  border: none;
+  border-top: 1px solid var(--rule);
+}
+
+/* Bullet list markers */
+.slidev-layout ul > li::marker {
+  color: var(--accent);
+}
+
+/* Custom pill used on the cover slide */
+.accent-pill {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  border: 1px solid var(--accent-line);
+  transition: background 0.15s ease;
+}
+.accent-pill:hover {
+  background: var(--accent-line);
+}
+
+/* Cards — for the grid / two-cols panels */
+.slidev-layout .border {
+  border-color: var(--accent-line) !important;
+  background: #fafefa;
+}
+
+/* Opacity tweaks so "opacity-75" reads as gray, not dim-green */
+.slidev-layout .opacity-75 {
+  color: var(--muted);
+  opacity: 1;
+}
+
+/* Dense-code layout — for slides with tall ASCII diagrams */
+.slidev-layout.tight-code pre,
+.slidev-layout.tight-code .slidev-code,
+.slidev-layout.tight-code div[class*="language-"] pre {
+  font-size: 0.52em !important;
+  line-height: 1.15 !important;
+  padding: 0.6em 0.8em !important;
+}
+.slidev-layout.tight-code pre code,
+.slidev-layout.tight-code .slidev-code code,
+.slidev-layout.tight-code div[class*="language-"] code {
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+.slidev-layout.tight-code h1 {
+  margin-bottom: 0.25rem;
+  font-size: 1.8rem;
+}
+.slidev-layout.tight-code p {
+  font-size: 0.85em;
+  margin: 0.3em 0;
+}
+
+/* Even tighter — for the very tall token-sequence layout slide */
+.slidev-layout.tighter-code pre,
+.slidev-layout.tighter-code .slidev-code,
+.slidev-layout.tighter-code div[class*="language-"] pre {
+  font-size: 0.42em !important;
+  line-height: 1.12 !important;
+  padding: 0.45em 0.65em !important;
+}
+.slidev-layout.tighter-code pre code,
+.slidev-layout.tighter-code .slidev-code code,
+.slidev-layout.tighter-code div[class*="language-"] code {
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+.slidev-layout.tighter-code h1 {
+  margin-bottom: 0.2rem;
+  font-size: 1.5rem;
+}
+.slidev-layout.tighter-code p {
+  font-size: 0.78em;
+  margin: 0.2em 0;
+}
+
+/* Compact-table layout — for slides with tall tables + closing notes */
+.slidev-layout.compact-table table {
+  font-size: 0.72em;
+}
+.slidev-layout.compact-table table th,
+.slidev-layout.compact-table table td {
+  padding: 0.18em 0.6em;
+}
+.slidev-layout.compact-table h1 {
+  margin-bottom: 0.25rem;
+  font-size: 1.8rem;
+}
+.slidev-layout.compact-table p {
+  font-size: 0.85em;
+  margin: 0.4em 0;
+}
+
+/* Dense layout — shrinks bullets + paragraphs for text-heavy slides */
+.slidev-layout.dense h1 {
+  margin-bottom: 0.25rem;
+  font-size: 1.8rem;
+}
+.slidev-layout.dense ul,
+.slidev-layout.dense ol {
+  font-size: 0.88em;
+  line-height: 1.5;
+}
+.slidev-layout.dense p {
+  font-size: 0.88em;
+  margin: 0.35em 0;
+}

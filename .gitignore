@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Per-machine Claude settings (project-shared settings would live in settings.json)
+.claude/settings.local.json
+
+# Slidev
+slides/node_modules/
+slides/dist/
+slides/.slidev/
+
+# Upstream Xiaomi reference clone (re-clone from upstream when needed)
+Xiaomi-Robotics-0/
+
+# Local secrets (defensive — none currently in tree)
+.env
+.env.*
+*.pem
+*.key
+credentials*.json

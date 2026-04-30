@@ -1,0 +1,19 @@
+{
+  "name": "unified-vla-slides",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "slidev --open",
+    "build": "slidev build",
+    "export": "slidev export"
+  },
+  "dependencies": {
+    "@slidev/cli": "^0.49.29",
+    "@slidev/theme-default": "latest",
+    "@slidev/theme-seriph": "latest",
+    "vue": "^3.5.12"
+  },
+  "devDependencies": {
+    "playwright-chromium": "^1.59.1"
+  }
+}
