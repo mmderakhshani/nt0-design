@@ -30,9 +30,6 @@ slides/node_modules/
 slides/dist/
 slides/.slidev/
 
-# Upstream Xiaomi reference clone (re-clone from upstream when needed)
-Xiaomi-Robotics-0/
-
 # Local secrets (defensive — none currently in tree)
 .env
 .env.*
