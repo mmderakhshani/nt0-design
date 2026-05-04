@@ -290,6 +290,52 @@ class SharedEmbodimentEmbedding(nn.Module):
         )
 
 
+class CentroidPosEmbed(nn.Module):
+    """Per-token positional encoding from FPS centroid xyz coordinates.
+
+    Mirrors Uni3D's input ``pos_embed`` (Linear(3, hidden) -> GELU ->
+    Linear(hidden, d)), but applied **at PC-expert entry** instead of inside
+    the encoder. The added signal compensates for chunk-shared MRoPE being
+    silent within a PC chunk — all M tokens in one chunk share one
+    ``(p, p, p)`` (see ``build_pc_chunk_position_ids``), so without an
+    explicit centroid signal here, intra-chunk geometric reasoning relies
+    entirely on Uni3D's frozen pos_embed surviving 24 ViT blocks of mixing.
+
+    The final Linear is zero-initialized: at step 0 every centroid maps to
+    the zero vector, so the projected PC tokens reaching ``SequenceBuilder``
+    are bit-for-bit unchanged from the non-centroid baseline. Same recipe as
+    adaLN-zero: preserves the VLM-init prior on the PC ExpertBlocks and lets
+    gradient lift the centroid contribution off zero smoothly.
+
+    Shared across cameras (same as Uni3D shares its pos_embed across all
+    patch positions). Wrist-vs-base specialisation is not done here; if it
+    turns out to matter, instantiate two ``CentroidPosEmbed``s and route by
+    ``is_wrist_per_camera``.
+    """
+
+    def __init__(self, d_pc: int, hidden: int = 128):
+        super().__init__()
+        self.fc1 = nn.Linear(3, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, d_pc)
+        # Zero-init the final Linear so step-0 output is exactly the zero
+        # vector — additive contribution to projected PC tokens is nil.
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, centroids: Tensor) -> Tensor:
+        """
+        Args:
+            centroids: ``(B, M, 3)`` FPS centroid xyz for one camera (apply
+                separately per camera and add to that camera's projected
+                Uni3D tokens before assembling the PC segment).
+        Returns:
+            ``(B, M, d_pc)`` positional embedding to be added to the
+            projected PC tokens.
+        """
+        return self.fc2(self.act(self.fc1(centroids)))
+
+
 class ProprioEncoder(nn.Module):
     """Projects raw proprio readings to action-stream tokens.
 
@@ -362,6 +408,70 @@ class AdaLNConditioner(nn.Module):
         out = self.mlp(t_emb)
         scale1, shift1, gate1, scale2, shift2, gate2 = out.chunk(6, dim=-1)
         return scale1, shift1, gate1, scale2, shift2, gate2
+
+
+def build_pc_chunk_position_ids(
+    pc_chunk_sizes: list[int],
+    start: int = 0,
+    has_sink: bool = True,
+    has_embodiment: bool = True,
+    has_align: bool = True,
+) -> tuple[list[int], int]:
+    """Build 1-D MRoPE position IDs for the PC segment under the chunk rule.
+
+    Each PC chunk (M tokens output by Uni3D for one camera) shares a
+    single position; sink/embodiment/align/`<pc_*_start>`/`<pc_*_end>`
+    follow the text rule (one position per token, counter +1 each).
+    Within a chunk all M tokens carry `(t, h, w) = (p, p, p)` so MRoPE
+    only signals "which chunk is this" via the chunk-level Δp; intra-
+    chunk geometry is already baked into the Uni3D patch tokens by its
+    pretrained `pos_embed` + 24 ViT blocks.
+
+    Layout matches `SequenceBuilder.forward`:
+
+        sink_pc          -> p,    p+=1
+        embodiment_pc    -> p,    p+=1
+        <align>          -> p,    p+=1
+        per camera (M = chunk_size):
+            <pc_*_start> -> p,    p+=1
+            M tokens     -> all share p, p+=1 (counter advances once for the chunk)
+            <pc_*_end>   -> p,    p+=1
+
+    Args:
+        pc_chunk_sizes: list of M_k values, one per camera. Length K.
+        start: starting position counter (typically max_vlm_pos + 1).
+        has_sink, has_embodiment, has_align: present in default
+            SequenceBuilder layout; flags exist for tests / future
+            variants.
+
+    Returns:
+        positions: list of length (has_sink + has_embodiment + has_align)
+            + sum(M_k + 2) — one entry per PC token, multiple tokens
+            sharing one value per chunk.
+        next_p: counter value for the action segment start.
+    """
+    positions: list[int] = []
+    p = start
+
+    if has_sink:
+        positions.append(p)
+        p += 1
+    if has_embodiment:
+        positions.append(p)
+        p += 1
+    if has_align:
+        positions.append(p)
+        p += 1
+
+    for M in pc_chunk_sizes:
+        positions.append(p)            # <pc_*_start>
+        p += 1
+        positions.extend([p] * M)      # chunk: all M tokens share p
+        p += 1
+        positions.append(p)            # <pc_*_end>
+        p += 1
+
+    return positions, p
 
 
 def modulate(x: Tensor, norm: nn.LayerNorm, scale: Tensor, shift: Tensor) -> Tensor:

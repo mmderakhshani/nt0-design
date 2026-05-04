@@ -203,12 +203,24 @@
   margin-bottom: 0.25rem;
   font-size: 1.8rem;
 }
+.slidev-layout.dense h2 {
+  font-size: 1.1rem;
+  margin: 0.45em 0 0.2em;
+}
+.slidev-layout.dense h3 {
+  font-size: 1rem;
+  margin: 0.4em 0 0.15em;
+}
 .slidev-layout.dense ul,
 .slidev-layout.dense ol {
-  font-size: 0.88em;
-  line-height: 1.5;
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+.slidev-layout.dense ul li,
+.slidev-layout.dense ol li {
+  margin: 0.15em 0;
 }
 .slidev-layout.dense p {
-  font-size: 0.88em;
-  margin: 0.35em 0;
+  font-size: 0.85em;
+  margin: 0.3em 0;
 }

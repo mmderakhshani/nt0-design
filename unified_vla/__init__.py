@@ -1,7 +1,8 @@
 from .core import (
     TokenType, TokenSequence, SequenceBuilder, AlignmentToken,
     InputProjections, SharedEmbodimentEmbedding, ProprioEncoder, AdaLNConditioner,
-    modulate,
+    CentroidPosEmbed,
+    build_pc_chunk_position_ids, modulate,
 )
 from .attention import ExpertQKV, build_attention_mask
 from .layers import ExpertBlock, GatedMLP, init_expert_from_vlm

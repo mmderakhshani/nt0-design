@@ -18,6 +18,7 @@ from transformers.masking_utils import create_causal_mask, create_sliding_window
 
 from .layers import ExpertBlock
 from .attention import _match_heads
+from .core import build_pc_chunk_position_ids
 
 
 def _build_action_cross_causal_mask(
@@ -265,20 +266,40 @@ class Backbone(nn.Module):
         n_pc: int,
         n_action: int,
         vlm_embeds: Tensor,
+        pc_chunk_sizes: list[int] | None = None,
     ) -> tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor]]:
         device = vlm_embeds.device
         B = vlm_embeds.shape[0]
         max_vlm_pos = vlm_rope_position_ids.max().item()
 
         pc_start = int(max_vlm_pos) + 1
+
+        if pc_chunk_sizes is None:
+            # Backwards-compatible: each PC token gets its own position step
+            # (1-D RoPE continuation, the original deck behavior).
+            pc_positions_1d = torch.arange(pc_start, pc_start + n_pc, device=device)
+            action_start = pc_start + n_pc
+        else:
+            # Chunk rule: all M tokens within one PC chunk share one position;
+            # sink/embodiment/align/delimiters follow the text rule.
+            positions, next_p = build_pc_chunk_position_ids(pc_chunk_sizes, start=pc_start)
+            if len(positions) != n_pc:
+                expected = 3 + sum(M + 2 for M in pc_chunk_sizes)
+                raise ValueError(
+                    f"PC layout mismatch: pc_chunk_sizes={pc_chunk_sizes} implies "
+                    f"{expected} tokens (3 pre-chunk + sum(M_k + 2) for K cameras), "
+                    f"but n_pc={n_pc}."
+                )
+            pc_positions_1d = torch.tensor(positions, device=device, dtype=torch.long)
+            action_start = next_p
+
         pc_pos_3d = (
-            torch.arange(pc_start, pc_start + n_pc, device=device)
+            pc_positions_1d
             .unsqueeze(0).expand(B, -1)
             .unsqueeze(0).expand(3, -1, -1)
         )
         pc_position_embeddings = self.vlm_rotary_emb(vlm_embeds[:, :n_pc], pc_pos_3d)
 
-        action_start = pc_start + n_pc
         action_pos_3d = (
             torch.arange(action_start, action_start + n_action, device=device)
             .unsqueeze(0).expand(B, -1)
@@ -296,7 +317,16 @@ class Backbone(nn.Module):
         cond: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor | None = None,
+        pc_chunk_sizes: list[int] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Args:
+            pc_chunk_sizes: optional list of M_k values, one per PC camera.
+                When provided, each chunk of M_k tokens shares one MRoPE
+                position (counter +1 once per chunk); sink/embodiment/align/
+                delimiters follow the text rule. When None, every PC token
+                advances the counter by 1 (legacy behavior).
+        """
         vlm_inputs = self._prepare_vlm_inputs(vlm_embeds, position_ids, attention_mask)
         kv_cache = DynamicCache()
 
@@ -305,6 +335,7 @@ class Backbone(nn.Module):
             n_pc=pc.shape[1],
             n_action=action.shape[1],
             vlm_embeds=vlm_embeds,
+            pc_chunk_sizes=pc_chunk_sizes,
         )
 
         for i, layer in enumerate(self.layers):

@@ -149,8 +149,11 @@ All encoders are frozen. Outputs are precomputed and cached by the dataloader. K
     -----                               -------                     ----------
     Images (xK) + text                  Qwen-VL ViT + tokenizer    native d_vlm (cached)
     Point clouds (xK, one per camera)   Pretrained PC encoder       Linear(encoder_dim, d_pc) per camera
+                                                                    + CentroidPosEmbed(centroids -> d_pc) added
     Noisy action chunk                  None (raw, noised at t)     Linear(action_dim, d_action)
     Proprio (P timesteps x 10)          None (raw floats)           ProprioEncoder: Linear(proprio_dim, d_action) -> action stream
+
+`CentroidPosEmbed` mirrors Uni3D's input `pos_embed` (`Linear(3, 128) -> GELU -> Linear(128, d_pc)`) and is applied to the cached FPS centroids; its output is added to the projected Uni3D tokens before they enter `SequenceBuilder`. The final `Linear` is zero-initialized — at step 0 the additive contribution is exactly zero, so the projected PC tokens are bit-for-bit identical to the no-centroid baseline. Same recipe as adaLN-zero: gradient lifts the centroid signal in smoothly. Shared across cameras (wrist and base alike) to mirror Uni3D's pos_embed sharing.
 
 Qwen2.5-VL-3B reference:
 
@@ -240,13 +243,49 @@ At each expert layer: VLM runs -> PC cross-attends to VLM K/V (detached) -> Acti
     Feature      VLM (Qwen layer)              PC (ExpertBlock)                Action (ExpertBlock)
     -------      ----------------              ----------------                --------------------
     Norm         Qwen2RMSNorm                  Qwen2RMSNorm                   Qwen2RMSNorm
-    RoPE         3D MRoPE (native)             MRoPE (1D, cont. from VLM)     MRoPE (1D, cont. from PC)
+    RoPE         3D MRoPE (native)             MRoPE chunk-shared (cont. from VLM)  MRoPE 1D (cont. from PC)
     GQA          native (16Q/2KV for 3B)       proportional to width          proportional to width
     MLP          GatedMLP (native)             GatedMLP (proportional)        GatedMLP (proportional)
     Self-attn    Causal + packed-sequence      Bidirectional                  Causal
     Cross-attn   N/A                           VLM K/V detached (expert layers)  VLM K/V detached + PC K/V w/ grad (expert layers, same layer)
     adaLN        None                          None                           timestep + embodiment + proprio history
     Status       Frozen                        Trainable (init from VLM)      Trainable (init from VLM)
+
+
+## Position-ID Construction (MRoPE)
+
+A single global counter `p` walks the full token sequence VLM → PC → Action, producing 3-axis MRoPE positions `(t, h, w)` per token. Each segment uses a different rule for advancing the counter:
+
+    Token type                                                      (t, h, w)         Counter advance
+    ----------                                                      ---------         ---------------
+    VLM text                                                        (p, p, p)         p += 1
+    VLM image patch (row r, col c, of HxW grid)                     (p, p+r, p+c)     p += max(H, W) once after the whole image
+    All delimiters (<pc_start/end>, <pc_wrist_start/end>, <align>,
+        <proprio_start/end>, <action_start/end>, <im_start>,
+        <vision_start>, ...)                                        (p, p, p)         p += 1
+    Per-segment scalars (sink_pc, embodiment_pc, sink_action,
+        embodiment_action)                                          (p, p, p)         p += 1
+    PC chunk (M tokens from one Uni3D run, one camera)              all M share (p, p, p)   p += 1 once for the whole chunk
+    Proprio token                                                   (p, p, p)         p += 1
+    Action token                                                    (p, p, p)         p += 1
+
+**PC chunk rule.** All M tokens in one PC chunk share the same `(p, p, p)`; the counter advances exactly once for the chunk as a whole. Inside a chunk, every pairwise `Δt = Δh = Δw = 0`, so MRoPE contributes no positional signal between chunk tokens — intra-chunk geometry is supplied by two channels: (1) Uni3D's pretrained `pos_embed` + 24 ViT blocks already baked it into the cached patch tokens, and (2) `CentroidPosEmbed` re-injects an explicit, fresh signal directly at PC-expert entry by adding `MLP(centroid_xyz)` to each projected token. Channel (2) is zero-init at step 0 so the prior is preserved; gradient ramps it up if intra-chunk reasoning needs more than what survived the encoder. Across chunks, `Δp ≥ 3` (separated by `<pc_*_end>` and `<pc_*_start>`), so different cameras' PC chunks remain positionally distinguishable.
+
+**Equivalence to 1-D RoPE.** Since `t = h = w` for every non-image-patch token, MRoPE collapses to ordinary 1-D RoPE on the PC and Action segments — the deck's "Scenario A" identity. The only segment where the three axes diverge is the VLM image-patch block, which keeps Qwen2.5-VL's native `(p, p+r, p+c)` rule.
+
+**Counter continuation.** PC positions start at `max_vlm_pos + 1`; action positions start at the PC counter's terminal value. The 1-D position list for the PC segment is built by `build_pc_chunk_position_ids(pc_chunk_sizes, start)` in `core.py`, which returns both the per-token positions (length `n_pc`) and the `next_p` to use for the action segment.
+
+**Layout assumed by the builder** (matches `SequenceBuilder.forward`):
+
+    sink_pc         -> p,    p+=1
+    embodiment_pc   -> p,    p+=1
+    <align>         -> p,    p+=1
+    per camera (M = chunk_size):
+        <pc_*_start> -> p,    p+=1
+        M tokens     -> all share p, p+=1 once for the whole chunk
+        <pc_*_end>   -> p,    p+=1
+
+**API.** `Backbone.forward(..., pc_chunk_sizes=[M_1, ..., M_K])` activates the chunk rule. Passing `pc_chunk_sizes=None` (the default) reproduces the legacy per-token 1-D continuation for backward compatibility.
 
 
 ## adaLN Conditioning — DiT adaLN-zero (6 mod params)
@@ -316,7 +355,7 @@ Example (Qwen2.5-VL-3B, 2 layers, d_pc=d_action=1024, all-cross):
 Dataloader provides cached VLM embeddings (text + vision merged), PC features, action ground truth.
 
 1. Project PC/Action to expert widths; noise action at random timestep t
-2. Prepare VLM inputs (position IDs, attention mask, RoPE) and expert positions (MRoPE continuation)
+2. Prepare VLM inputs (position IDs, attention mask, RoPE) and expert positions (PC chunk-shared MRoPE via `pc_chunk_sizes`; Action 1-D MRoPE continuation)
 3. Forward through backbone (VLM at every layer, experts at configured layers)
 4. Losses: flow matching on Action output, MSE on PC output. No loss on VLM.
 
@@ -352,7 +391,7 @@ Dataloader provides cached VLM embeddings (text + vision merged), PC features, a
     unified_vla/
     ├── core.py         TokenType, TokenSequence, SequenceBuilder, AlignmentToken,
     │                   InputProjections, SharedEmbodimentEmbedding, ProprioEncoder,
-    │                   AdaLNConditioner (timestep-only), modulate
+    │                   AdaLNConditioner (timestep-only), CentroidPosEmbed, modulate
     ├── attention.py    ExpertQKV (GQA), build_attention_mask, _match_heads,
     │                   detached_cross_modal_attention
     ├── layers.py       GatedMLP, ExpertBlock (RMSNorm + MRoPE + mask + adaLN), init_expert_from_vlm
@@ -374,7 +413,7 @@ Dataloader provides cached VLM embeddings (text + vision merged), PC features, a
 
 ## Implementation Status
 
-211 tests (unit + integration), all passing.
+243 tests (unit + integration), all passing.
 
 --- Completed ---
 
@@ -400,6 +439,9 @@ Dataloader provides cached VLM embeddings (text + vision merged), PC features, a
 - [x] **Init new delimiter tokens from VLM embeddings + ε** — `init_special_tokens_from_vlm(sequence_builder, qwen_model, eps=1e-3)` overwrites `<pc_*>`, `<proprio_*>`, `<action_*>` Parameters with `mean(<vision_start>, <vision_end>)[:expert_width] + N(0, ε)`. `<align>` is left random; `SharedEmbodimentEmbedding` self-inits in its `__init__` (Recipe-2: zero-init projections).
 - [x] **Remove stop-gradient PC → Action** — `.detach()` dropped from PC K/V in `backbone.py:MultiExpertLayer.forward` and in `attention.py:detached_cross_modal_attention`. Action flow-matching loss now flows back into the PC expert via cross-attention. VLM K/V remain detached (still frozen).
 - [x] **Proprio delimiters** — `<proprio_start>` / `<proprio_end>` learnable embeddings (`d_action`) added in `SequenceBuilder`; `init_special_tokens_from_vlm` bootstraps them from the same `mean(<vision_start>, <vision_end>) + N(0, ε)` base used for the action delimiters. Action segment is now `[<proprio_start>, P proprio, <proprio_end>, <action_start>, T action, <action_end>]` so the boundary stays unambiguous when P varies sample to sample.
+- [x] **PC-chunk shared MRoPE positions** — `build_pc_chunk_position_ids(pc_chunk_sizes, start)` in `core.py`; `Backbone.forward(..., pc_chunk_sizes=[M_1, ..., M_K])` plumbs the chunk descriptor through. All M tokens in one PC chunk share `(p, p, p)`; sink/embodiment/align/`<pc_*_start/end>` follow the text rule. Replaces the original "3D RoPE for PC expert" backlog item — intra-chunk 3D geometry is already encoded by Uni3D's frozen `pos_embed` + ViT blocks, so MRoPE only signals "which chunk is this" via chunk-level `Δp ≥ 3`. `pc_chunk_sizes=None` (default) preserves the legacy per-token 1-D continuation for backward compatibility.
+
+- [x] **CentroidPosEmbed at PC-expert entry** — `CentroidPosEmbed(d_pc, hidden=128)` in `core.py` mirrors Uni3D's input `pos_embed` (`Linear(3, 128) -> GELU -> Linear(128, d_pc)`) but is applied to the cached FPS centroids on the unified-VLA side, then **added** to the projected Uni3D tokens per camera before `SequenceBuilder`. Final `Linear` is zero-initialized — step-0 contribution is exactly zero, so projected PC tokens are bit-for-bit identical to the no-centroid baseline at init (adaLN-zero recipe). Provides intra-chunk geometric signal that MRoPE can no longer carry under the chunk rule, and a fresh re-injection that doesn't depend on Uni3D's `pos_embed` surviving 24 ViT blocks of mixing. One module shared across all cameras (wrist and base alike).
 
 --- Remaining ---
 
@@ -411,7 +453,7 @@ Dataloader provides cached VLM embeddings (text + vision merged), PC features, a
 
 ## Architecture backlog (Phase 1)
 
-- [ ] **3D RoPE for PC expert** — replace the current sequential 1-D MRoPE continuation on PC tokens with true 3D RoPE rotating Q/K pairs by `(Δx, Δy, Δz)` from each patch's centroid. Coordinate scaling / quantization scheme to be decided during implementation.
+- [ ] **Wrist-camera Uni3D encoder** — second pretrained Uni3D model specialized for wrist-cam point clouds (different distance distribution, close-up gripper geometry). Tokens come from the dataloader; the backbone treats wrist-cam chunks identically to base-cam chunks (same `pc_chunk_sizes` rule, separate `<pc_wrist_*>` delimiters already present).
 
 - [ ] **Paired camera shuffle (augmentation)** — DataLoader-level: sample a random camera-order permutation per sample and apply the **same** permutation to the image and PC streams so `(img_i, pc_i)` pairs stay aligned. Invalidates ViT-embedding caches that assume a fixed order — cache keys must include the permutation. The PC permutation must also reorder `is_wrist_per_camera` so each camera keeps its wrist tag.
 
@@ -420,4 +462,4 @@ Dataloader provides cached VLM embeddings (text + vision merged), PC features, a
 - [ ] **Finetune PC encoder flag** — add `finetune_pc_encoder: bool = False`. When enabled, disable cached PC encoder outputs and train Uni3D end-to-end. **Cost:** step time and memory both grow; caching win is lost. Partial unfreezing (last `k` Uni3D blocks) is a sub-option to explore.
 
 *Suggested execution order (small / isolated → architectural → data-aug → expensive):*
-*3D RoPE → camera shuffle → camera dropping → PC finetune flag.*
+*wrist Uni3D wiring → camera shuffle → camera dropping → PC finetune flag.*

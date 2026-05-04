@@ -1,8 +1,8 @@
 ---
 theme: default
-title: Unified VLA — Single-Backbone Multi-Expert Architecture
+title: Toward NT0
 info: |
-  ## Unified VLA
+  ## Toward NT0
   Qwen2.5-VL backbone with per-layer modality experts for vision-language
   understanding, point-cloud grounding, and action denoising.
 class: text-center
@@ -13,7 +13,7 @@ mdc: true
 colorSchema: light
 ---
 
-# Unified VLA
+# Toward NT0
 
 ## Single-Backbone Multi-Expert Architecture
 
@@ -126,9 +126,7 @@ Each signal enters the model through **one or two paths**:
 layout: default
 ---
 
-# Conditioning — Proprio & Embodiment
-
-<br>
+# Conditioning — Proprio
 
 ## Proprio → Action-stream tokens
 
@@ -136,17 +134,24 @@ layout: default
 - Wrapped in `<proprio_start>` / `<proprio_end>` learned delimiters and prepended to the action chunk inside the Action expert.
 - A unified causal mask covers `[<proprio_start>, proprio, <proprio_end>, <action_start>, action, <action_end>]` so action tokens attend back to proprio while staying causal among themselves; the delimiters give the model a learned cue for the proprio block boundary even when P varies sample to sample.
 
-<br>
+---
+layout: default
+---
+
+# Conditioning — Embodiment
 
 ## Embodiment → shared bottleneck across PC + Action
 
 - One `nn.Embedding(NUM_ROBOTS=3, d_emb)` base + two zero-init `Linear(d_emb, d_*, bias=False)` heads in `SharedEmbodimentEmbedding`.
-- `embodiment_pc` lands at **position 1 of the PC segment** (`sink_pc` occupies position 0).
-- `embodiment_action` lands at **position 1 of the Action segment** (`sink_action` at position 0).
+- `embodiment_pc` lands at **position 1 of the PC segment** (`sink_pc` occupies position 0); `embodiment_action` at position 1 of the Action segment.
 - Both losses train the same base via the two projections; Action loss also reaches `to_pc` indirectly through the no-detach PC→Action cross-attention.
 - The frozen VLM still gets per-robot context via the **textual** `Robot: {description}` line — no learned token in the VLM segment.
 
-<br>
+---
+layout: default
+---
+
+# Conditioning — Attention Sinks
 
 ## Attention sinks → two separate Parameters
 
@@ -374,6 +379,7 @@ layout: default
 
 ---
 layout: default
+class: compact-table
 ---
 
 # Input Encoders
@@ -383,11 +389,11 @@ All encoders are **frozen**. Outputs are precomputed and cached by the dataloade
 | Input | Encoder | Projection |
 |-------|---------|------------|
 | Images (×K) + text | Qwen-VL ViT + tokenizer | native `d_vlm` (cached) |
-| Point clouds (×K, one per cam) | Pretrained PC encoder | `Linear(enc_dim, d_pc)` per cam |
+| Point clouds (×K, one per cam) | Pretrained PC encoder | `Linear(enc_dim, d_pc)` per cam **+** `CentroidPosEmbed(xyz → d_pc)` added |
 | Noisy action chunk | — (raw, noised at `t`) | `Linear(action_dim, d_action)` |
 | Proprio (P × 10) | — (raw floats) | `ProprioEncoder`: `Linear(proprio_dim, d_action)` → action stream |
 
-<br>
+`CentroidPosEmbed` mirrors Uni3D's input `pos_embed` (`Linear(3, 128) → GELU → Linear(128, d_pc)`); applied to cached FPS centroids and **added** to the projected Uni3D tokens before `SequenceBuilder`. Final `Linear` is zero-init → step-0 contribution is exactly zero.
 
 ## Qwen2.5-VL-3B reference
 
@@ -443,6 +449,16 @@ layout: default
 "All" and "Dense" have identical trainable counts — the difference is only in the attention pattern at non-expert layers (cross vs self-only).
 Sparse skips the experts entirely at non-expert layers.
 
+</div>
+
+---
+layout: default
+---
+
+# Architecture Summary
+
+<div class="flex justify-center items-center h-[80%]">
+  <img src="./arch.png" class="max-h-full max-w-full object-contain" alt="Multi-expert transformer block: VL / Point Cloud / Action streams" />
 </div>
 
 ---
@@ -512,6 +528,7 @@ All three use the same layer's features.
 
 ---
 layout: default
+class: compact-table
 ---
 
 # Per-Layer Expert Details
@@ -519,13 +536,110 @@ layout: default
 | Feature | VLM (Qwen layer) | PC (ExpertBlock) | Action (ExpertBlock) |
 |---------|------------------|------------------|----------------------|
 | **Norm** | `Qwen2RMSNorm` | `Qwen2RMSNorm` | `Qwen2RMSNorm` |
-| **RoPE** | 3D MRoPE (native) | MRoPE (1D, cont. from VLM) | MRoPE (1D, cont. from PC) |
+| **RoPE** | 3D MRoPE (native) | MRoPE chunk-shared (cont. from VLM) | MRoPE 1D (cont. from PC) |
 | **GQA** | native (16Q/2KV for 3B) | proportional to width | proportional to width |
 | **MLP** | GatedMLP (native) | GatedMLP (proportional) | GatedMLP (proportional) |
 | **Self-attn** | Causal + packed-seq | Bidirectional | Causal |
 | **Cross-attn** | N/A | VLM K/V detached (expert layers) | VLM K/V detached + PC K/V w/ grad (expert layers) |
 | **adaLN** | None | None | timestep only |
 | **Status** | Frozen | Trainable (init from VLM) | Trainable (init from VLM) |
+
+---
+layout: default
+class: compact-table
+---
+
+# Position-ID Rule
+
+A **single global counter `p`** walks VLM → PC → Action. Each token type advances the counter differently:
+
+| Token | `(t, h, w)` | Counter |
+|---|---|---|
+| VLM text | `(p, p, p)` | `p += 1` |
+| VLM image patch (row `r`, col `c` of `H×W`) | `(p, p+r, p+c)` | `p += max(H, W)` once after the whole image |
+| All delimiters (`<pc_start/end>`, `<pc_wrist_start/end>`, `<align>`, `<proprio_start/end>`, `<action_start/end>`, …) | `(p, p, p)` | `p += 1` |
+| Per-segment scalars (`sink_pc`, `embodiment_pc`, `sink_action`, `embodiment_action`) | `(p, p, p)` | `p += 1` |
+| **PC chunk (M tokens from one Uni3D run)** | **all M share `(p, p, p)`** | **`p += 1` once for the whole chunk** |
+| Proprio token | `(p, p, p)` | `p += 1` |
+| Action token | `(p, p, p)` | `p += 1` |
+
+Since `t = h = w` everywhere except VLM image patches, MRoPE collapses to **1-D RoPE** on the PC and Action segments.
+
+---
+layout: default
+class: dense
+---
+
+# PC-Chunk MRoPE — Why Chunk-Shared
+
+Inside one PC chunk, all M tokens carry **identical** `(p, p, p)` → pairwise `Δp = 0` → MRoPE contributes **no positional signal *within* a chunk**. That's intentional — intra-chunk geometry is supplied by **two channels**: (1) Uni3D's pretrained `pos_embed` + 24 ViT blocks already baked it into the cached patch tokens, and (2) `CentroidPosEmbed` re-injects an explicit, fresh signal at PC-expert entry. **Across** chunks, `Δp ≥ 3` (separated by `<pc_*_end>` and `<pc_*_start>`) → MRoPE *does* carry the relative-position signal, so cross-camera attention can tell chunks apart and message-pass between them.
+
+```text
+seq idx  token             t  h  w
+   0     sink_pc           0  0  0
+   1     embodiment_pc     1  1  1
+   2     <align>           2  2  2
+   3     <pc_start>        3  3  3
+   4..   pc1_tok_1..M      4  4  4    ← chunk 1: all M share (4,4,4); counter +1 once
+   M+4   <pc_end>          5  5  5
+   M+5   <pc_start>        6  6  6
+   M+6.. pc2_tok_1..M      7  7  7    ← chunk 2: all M share (7,7,7); counter +1 once
+   2M+6  <pc_end>          8  8  8
+```
+
+**Two pretrained Uni3D encoders** (base cams, wrist cams) — tokens come from the dataloader at width `d_pc`.
+
+---
+layout: default
+class: dense
+---
+
+# PC-Chunk MRoPE — API
+
+`build_pc_chunk_position_ids(pc_chunk_sizes, start)` in `core.py` returns the 1-D position list plus `next_p` for the action start:
+
+```python
+positions, next_p = build_pc_chunk_position_ids([4, 4], start=10)
+# positions = [10, 11, 12,                 sink, emb, align
+#              13, 14, 14, 14, 14, 15,     <s>, [4]×4, <e>
+#              16, 17, 17, 17, 17, 18]     <s>, [4]×4, <e>
+# next_p    = 19                           (action segment starts here)
+```
+
+`Backbone.forward(..., pc_chunk_sizes=[M_1, …, M_K])` activates the rule. `pc_chunk_sizes=None` (default) preserves the legacy per-token 1-D continuation.
+
+Layout (matches `SequenceBuilder.forward`): `sink_pc → emb_pc → <align>` each `p+=1`, then per camera `<pc_*_start>` `p+=1`, **M chunk tokens share `p`** then `p+=1`, `<pc_*_end>` `p+=1`.
+
+---
+layout: default
+class: dense tight-code
+---
+
+# CentroidPosEmbed — Re-injecting Intra-Chunk Geometry
+
+Chunk-shared MRoPE is **silent within a PC chunk**. Intra-chunk geometry then depends on Uni3D's `pos_embed` surviving 24 ViT blocks — thin. `CentroidPosEmbed` adds a **fresh, explicit** signal at PC-expert entry, mirroring Uni3D's own recipe:
+
+```python
+class CentroidPosEmbed(nn.Module):                      # core.py
+    def __init__(self, d_pc: int, hidden: int = 128):
+        self.fc1 = nn.Linear(3, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, d_pc)
+        nn.init.zeros_(self.fc2.weight)                 # adaLN-zero recipe
+        nn.init.zeros_(self.fc2.bias)                   # step-0 output ≡ 0
+
+    def forward(self, centroids):                       # (B, M, 3) → (B, M, d_pc)
+        return self.fc2(self.act(self.fc1(centroids)))
+```
+
+Per-camera composition before `SequenceBuilder`:
+
+```python
+pc_tokens_per_cam[k] = pc_proj(features[k]) + centroid_pos_embed(centroids[k])
+```
+
+- **Zero-init final Linear** → step-0 output ≡ 0 → projected PC tokens are bit-for-bit identical to the no-centroid baseline (preserves the VLM-init prior on PC ExpertBlocks).
+- **Hidden = 128** mirrors Uni3D's `Linear(3, 128) → GELU → Linear(128, embed_dim)` recipe; **shared across cameras** (wrist + base).
 
 ---
 layout: default
@@ -749,6 +863,7 @@ ViT and PC encoder are frozen — run once per sample in preprocessing.
 
 ---
 layout: default
+class: dense
 ---
 
 # Design Rationale — Part 3
@@ -776,7 +891,7 @@ layout: default
 unified_vla/
 ├── core.py        TokenType, TokenSequence, SequenceBuilder, AlignmentToken,
 │                  InputProjections, SharedEmbodimentEmbedding, ProprioEncoder,
-│                  AdaLNConditioner (timestep-only), modulate
+│                  AdaLNConditioner (timestep-only), CentroidPosEmbed, modulate
 ├── attention.py   ExpertQKV (GQA), build_attention_mask, _match_heads,
 │                  detached_cross_modal_attention
 ├── layers.py      GatedMLP, ExpertBlock (RMSNorm + MRoPE + mask + adaLN),
@@ -814,7 +929,7 @@ layout: default
 
 <br>
 
-**211 tests** (unit + integration), **all passing**.
+**243 tests** (unit + integration), **all passing**.
 
 <br>
 
@@ -854,6 +969,8 @@ layout: default
 - ✅ **Init new delimiter tokens from VLM embeddings + ε** — `init_special_tokens_from_vlm(sequence_builder, qwen_model, eps=1e-3)` overwrites `<pc_*>`, `<proprio_*>`, `<action_*>` Parameters with `mean(<vision_start>, <vision_end>)[:expert_width] + N(0, ε)`; `<align>` left random; `SharedEmbodimentEmbedding` self-inits (Recipe-2)
 - ✅ **Remove stop-gradient PC → Action** — `.detach()` dropped from PC K/V in `backbone.py` and `attention.py:detached_cross_modal_attention`. Action flow-matching loss now flows back into the PC expert; VLM K/V remain detached
 - ✅ **Proprio delimiters** — `<proprio_start>` / `<proprio_end>` learnable embeddings (`d_action`) wrap the variable-length proprio block; bootstrapped from the same vision-tokens base by `init_special_tokens_from_vlm`
+- ✅ **PC-chunk shared MRoPE positions** — `build_pc_chunk_position_ids(pc_chunk_sizes, start)` in `core.py`; `Backbone.forward(..., pc_chunk_sizes=[M_1, …, M_K])` activates the chunk rule. All M tokens in one PC chunk share `(p, p, p)`; sink/embodiment/align/`<pc_*_start/end>` follow the text rule. Replaces the original "3D RoPE for PC expert" backlog item — intra-chunk geometry is already encoded by Uni3D's frozen `pos_embed` + ViT blocks.
+- ✅ **CentroidPosEmbed at PC-expert entry** — `CentroidPosEmbed(d_pc, hidden=128)` in `core.py` mirrors Uni3D's input `pos_embed` (`Linear(3, 128) → GELU → Linear(128, d_pc)`) and is added to the projected Uni3D tokens per camera before `SequenceBuilder`. Final `Linear` is zero-initialized → step-0 output is exactly zero (adaLN-zero recipe), so projected PC tokens are bit-for-bit identical to baseline at init. Re-injects intra-chunk geometric signal that chunk-shared MRoPE can no longer carry.
 
 </div>
 
@@ -876,7 +993,7 @@ class: dense
 
 # Remaining — Architecture Backlog (Phase 1)
 
-- ⬜ **3D RoPE for PC expert** — rotate Q/K pairs by `(Δx, Δy, Δz)` from patch centroids (replace sequential MRoPE)
+- ⬜ **Wrist-camera Uni3D encoder** — second pretrained Uni3D for wrist clouds (close-up, gripper-scale geometry); tokens come from dataloader; backbone treats wrist chunks identically (same `pc_chunk_sizes` rule, separate `<pc_wrist_*>` delimiters already wired).
 - ⬜ **Paired camera shuffle** — DataLoader aug; same permutation on image + PC streams (and the matching `is_wrist_per_camera` list).
 - ⬜ **Paired camera dropping** — precompute `E_zero = ViT(zero_image)` once; swap dropped cameras' cached embedding with `E_zero`; keep ≥ 1 camera.
 - ⬜ **Finetune PC encoder flag** — `finetune_pc_encoder: bool = False`; disables caching when enabled. Direction to explore.
